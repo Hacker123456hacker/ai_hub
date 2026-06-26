@@ -1,0 +1,29 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+*.iml
+
+# Android
+android/local.properties
+android/key.properties
+android/.gradle/
+android/app/release/
+*.jks
+*.keystore
+
+# Generated (regenerate with build_runner if you want fresh ones)
+# Comment out the next two lines if you prefer to keep the hand-written
+# adapters that ship with this repo.
+# **/*.g.dart
+
+# IDE
+.idea/
+*.swp
+
+# macOS / misc
+.DS_Store
