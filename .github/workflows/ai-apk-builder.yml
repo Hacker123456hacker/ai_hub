@@ -21,34 +21,37 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Write local.properties
+      - name: Create Android project if missing
         run: |
-          FLUTTER_PATH=$(dirname $(dirname $(which flutter)))
-          echo "flutter.sdk=$FLUTTER_PATH" > android/local.properties
-          echo "sdk.dir=$ANDROID_SDK_ROOT" >> android/local.properties
-          echo "--- local.properties ---"
-          cat android/local.properties
+          if [ ! -d "android" ]; then
+            echo "android/ not found — running flutter create"
+            flutter create --platforms=android .
+          fi
 
-      - name: Fix gradle.properties
+      - name: Fix gradle.properties JVM args
         run: |
           PROPS="android/gradle.properties"
+          # Remove any existing jvmargs line (handles malformed ones)
           sed -i '/^org\.gradle\.jvmargs/d' "$PROPS" 2>/dev/null || true
-          sed -i '/^org\.gradle\.daemon/d' "$PROPS" 2>/dev/null || true
+          # Write a clean correct line
           echo 'org.gradle.jvmargs=-Xmx4g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8' >> "$PROPS"
-          echo 'org.gradle.daemon=false' >> "$PROPS"
           echo 'android.useAndroidX=true' >> "$PROPS"
           echo 'android.enableJetifier=true' >> "$PROPS"
+          echo "--- gradle.properties ---"
           cat "$PROPS"
 
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Build APK
-        run: flutter build apk --release --android-skip-build-dependency-validation
+      - name: Generate code (build_runner)
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Build aab
+        run: flutter build appbundle --release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-apk-release
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: app-aab-release
+          path: build/app/outputs/bundle/release/app-release.aab
           retention-days: 14
