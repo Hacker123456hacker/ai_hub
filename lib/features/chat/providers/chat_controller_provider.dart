@@ -19,13 +19,12 @@ class ChatScreenState {
     List<ChatMessage>? messages,
     bool? isSending,
     String? error,
-  }) {
-    return ChatScreenState(
-      messages: messages ?? this.messages,
-      isSending: isSending ?? this.isSending,
-      error: error,
-    );
-  }
+  }) =>
+      ChatScreenState(
+        messages: messages ?? this.messages,
+        isSending: isSending ?? this.isSending,
+        error: error,
+      );
 }
 
 class ChatController extends StateNotifier<ChatScreenState> {
@@ -40,8 +39,7 @@ class ChatController extends StateNotifier<ChatScreenState> {
       state = const ChatScreenState();
       return;
     }
-    final messages =
-        ref.read(chatRepositoryProvider).getMessagesForSession(sessionId);
+    final messages = ref.read(chatRepositoryProvider).getMessagesForSession(sessionId);
     state = ChatScreenState(messages: messages);
   }
 
@@ -50,31 +48,22 @@ class ChatController extends StateNotifier<ChatScreenState> {
 
     final repo = ref.read(chatRepositoryProvider);
     final apiKeyState = ref.read(apiKeyProvider);
-    final apiKeyNotifier = ref.read(apiKeyProvider.notifier);
     final modelId = ref.read(activeChatModelProvider);
-    final temperature = ref.read(temperatureProvider);
-    final maxTokens = ref.read(maxTokensProvider);
 
     if (apiKeyState.status != ApiKeyStatus.valid) {
-      state = state.copyWith(
-        error: 'Add a valid OpenRouter API key in Settings to start chatting.',
-      );
+      state = state.copyWith(error: 'Add your OpenRouter API key in Settings first.');
       return;
     }
 
-    final apiKey = await apiKeyNotifier.getRawKey();
+    final apiKey = await ref.read(apiKeyProvider.notifier).getRawKey();
     if (apiKey == null || apiKey.isEmpty) {
-      state = state.copyWith(
-        error: 'Add a valid OpenRouter API key in Settings to start chatting.',
-      );
+      state = state.copyWith(error: 'Add your OpenRouter API key in Settings first.');
       return;
     }
 
-    // Create the session lazily on first message.
+    // Create session lazily on first message
     if (chatId == null) {
-      final title = text.trim().length > 40
-          ? '${text.trim().substring(0, 40)}…'
-          : text.trim();
+      final title = text.trim().length > 40 ? '${text.trim().substring(0, 40)}…' : text.trim();
       final session = repo.createSession(modelId: modelId, title: title);
       chatId = session.id;
       ref.read(chatSessionsProvider.notifier).state = repo.getAllSessions();
@@ -82,17 +71,11 @@ class ChatController extends StateNotifier<ChatScreenState> {
     }
 
     final userMessage = await repo.addMessage(
-      chatId: chatId!,
-      content: text.trim(),
-      role: MessageRole.user,
+      chatId: chatId!, content: text.trim(), role: MessageRole.user,
     );
-
     final assistantMessage = await repo.addMessage(
-      chatId: chatId!,
-      content: '',
-      role: MessageRole.assistant,
-      modelId: modelId,
-      isStreaming: true,
+      chatId: chatId!, content: '', role: MessageRole.assistant,
+      modelId: modelId, isStreaming: true,
     );
 
     state = state.copyWith(
@@ -113,72 +96,47 @@ class ChatController extends StateNotifier<ChatScreenState> {
     final buffer = StringBuffer();
 
     try {
-      await for (final chunk in service.streamChatCompletion(
+      await for (final chunk in service.streamWithCleanErrors(
         apiKey: apiKey,
         model: modelId,
         messages: history,
-        temperature: temperature,
-        maxTokens: maxTokens,
+        temperature: ref.read(temperatureProvider),
+        maxTokens: ref.read(maxTokensProvider),
       )) {
         buffer.write(chunk);
-        _updateAssistantMessage(assistantMessage.id, buffer.toString());
+        _updateMsg(assistantMessage.id, buffer.toString());
       }
-
-      await repo.updateMessageContent(
-        assistantMessage.id,
-        buffer.toString(),
-        isStreaming: false,
-      );
-      _updateAssistantMessage(
-        assistantMessage.id,
-        buffer.toString(),
-        isStreaming: false,
-      );
+      await repo.updateMessageContent(assistantMessage.id, buffer.toString(), isStreaming: false);
+      _updateMsg(assistantMessage.id, buffer.toString(), isStreaming: false);
     } catch (e) {
-      final errorText = buffer.isEmpty
-          ? 'Failed to get a response: ${e.toString()}'
-          : buffer.toString();
-      await repo.updateMessageContent(
-        assistantMessage.id,
-        errorText,
-        isStreaming: false,
-        isError: buffer.isEmpty,
-      );
-      _updateAssistantMessage(
-        assistantMessage.id,
-        errorText,
-        isStreaming: false,
-        isError: buffer.isEmpty,
-      );
+      // Show a clean error, not the raw DioException toString
+      String errorText;
+      if (e is Exception) {
+        errorText = e.toString().replaceFirst('Exception: ', '');
+      } else {
+        errorText = 'Something went wrong. Try again.';
+      }
+      final displayText = buffer.isEmpty ? '⚠️ $errorText' : buffer.toString();
+      await repo.updateMessageContent(assistantMessage.id, displayText,
+          isStreaming: false, isError: buffer.isEmpty);
+      _updateMsg(assistantMessage.id, displayText, isStreaming: false, isError: buffer.isEmpty);
     } finally {
       state = state.copyWith(isSending: false);
       ref.read(chatSessionsProvider.notifier).state = repo.getAllSessions();
     }
   }
 
-  void _updateAssistantMessage(
-    String messageId,
-    String content, {
-    bool isStreaming = true,
-    bool isError = false,
-  }) {
-    final updated = state.messages.map((m) {
-      if (m.id != messageId) return m;
-      return m.copyWith(
-        content: content,
-        isStreaming: isStreaming,
-        isError: isError,
-      );
-    }).toList();
-    state = state.copyWith(messages: updated);
+  void _updateMsg(String id, String content, {bool isStreaming = true, bool isError = false}) {
+    state = state.copyWith(
+      messages: state.messages.map((m) {
+        if (m.id != id) return m;
+        return m.copyWith(content: content, isStreaming: isStreaming, isError: isError);
+      }).toList(),
+    );
   }
 
-  void clearError() {
-    state = state.copyWith(error: null);
-  }
+  void clearError() => state = state.copyWith(error: null);
 }
 
 final chatControllerProvider =
-    StateNotifierProvider<ChatController, ChatScreenState>((ref) {
-  return ChatController(ref);
-});
+    StateNotifierProvider<ChatController, ChatScreenState>((ref) => ChatController(ref));
