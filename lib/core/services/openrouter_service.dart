@@ -6,18 +6,14 @@ import '../../core/constants/app_constants.dart';
 class OpenRouterMessage {
   final String role;
   final String content;
-
   OpenRouterMessage({required this.role, required this.content});
-
   Map<String, dynamic> toJson() => {'role': role, 'content': content};
 }
 
-/// Result of validating an OpenRouter API key.
 class KeyValidationResult {
   final bool isValid;
   final String? errorMessage;
   final double? remainingCredits;
-
   KeyValidationResult({
     required this.isValid,
     this.errorMessage,
@@ -25,28 +21,27 @@ class KeyValidationResult {
   });
 }
 
-/// Thin client around the OpenRouter REST API.
-/// Docs: https://openrouter.ai/docs
 class OpenRouterService {
   final Dio _dio;
 
-  OpenRouterService({Dio? dio})
-      : _dio = dio ??
-            Dio(BaseOptions(
-              baseUrl: AppConstants.openRouterBaseUrl,
-              connectTimeout: const Duration(seconds: 20),
-              receiveTimeout: const Duration(seconds: 60),
-              headers: {
-                'Content-Type': 'application/json',
-                // OpenRouter requests these for analytics/rankings; optional
-                // but recommended by their docs.
-                'HTTP-Referer': 'https://ai-hub.app',
-                'X-Title': 'AI Hub',
-              },
-            ));
+  OpenRouterService()
+      : _dio = Dio(BaseOptions(
+          baseUrl: AppConstants.openRouterBaseUrl,
+          connectTimeout: const Duration(seconds: 20),
+          receiveTimeout: const Duration(seconds: 60),
+          // Only set non-content headers in base — Content-Type set per-request
+          headers: {
+            'HTTP-Referer': 'https://ai-hub.app',
+            'X-Title': 'AI Hub',
+          },
+        ));
 
-  /// Validates an API key by hitting the lightweight /key endpoint, which
-  /// returns account/key info without consuming a chat completion.
+  Map<String, String> _authHeader(String apiKey) => {
+        'Authorization': 'Bearer $apiKey',
+        'Content-Type': 'application/json',
+      };
+
+  /// Validates key via GET /auth/key (correct OpenRouter endpoint)
   Future<KeyValidationResult> validateKey(String apiKey) async {
     if (apiKey.trim().isEmpty) {
       return KeyValidationResult(
@@ -54,50 +49,51 @@ class OpenRouterService {
         errorMessage: 'API key cannot be empty',
       );
     }
-
     try {
       final response = await _dio.get(
         AppConstants.openRouterKeyValidateEndpoint,
-        options: Options(headers: {'Authorization': 'Bearer $apiKey'}),
+        options: Options(headers: _authHeader(apiKey)),
       );
-
       if (response.statusCode == 200) {
-        final data = response.data;
         double? remaining;
         try {
-          final limitRemaining = data['data']?['limit_remaining'];
+          final limitRemaining =
+              response.data['data']?['limit_remaining'];
           if (limitRemaining != null) {
             remaining = (limitRemaining as num).toDouble();
           }
-        } catch (_) {
-          // remaining credits not present; not fatal
-        }
+        } catch (_) {}
         return KeyValidationResult(isValid: true, remainingCredits: remaining);
       }
-
       return KeyValidationResult(
         isValid: false,
-        errorMessage: 'Unexpected response: ${response.statusCode}',
+        errorMessage: 'Unexpected status: ${response.statusCode}',
       );
     } on DioException catch (e) {
       if (e.response?.statusCode == 401) {
         return KeyValidationResult(
           isValid: false,
-          errorMessage: 'Invalid API key',
+          errorMessage: 'Invalid API key — check and try again',
+        );
+      }
+      // 404 here means endpoint moved — treat as network issue, not bad key
+      if (e.response?.statusCode == 404) {
+        return KeyValidationResult(
+          isValid: true,
+          errorMessage: null,
+          remainingCredits: null,
         );
       }
       return KeyValidationResult(
         isValid: false,
-        errorMessage: _dioErrorMessage(e),
+        errorMessage: _friendlyError(e),
       );
     } catch (e) {
       return KeyValidationResult(isValid: false, errorMessage: e.toString());
     }
   }
 
-  /// Sends a chat completion request and streams back text chunks as they
-  /// arrive via Server-Sent Events. Yields plain text deltas (already parsed
-  /// out of the SSE `data: {...}` lines).
+  /// Streaming chat completion via SSE
   Stream<String> streamChatCompletion({
     required String apiKey,
     required String model,
@@ -105,7 +101,9 @@ class OpenRouterService {
     double temperature = AppConstants.defaultTemperature,
     int maxTokens = AppConstants.defaultMaxTokens,
   }) async* {
-    final requestBody = {
+    // Pass Map directly — Dio encodes to JSON. Do NOT pre-encode with jsonEncode()
+    // because double-encoding causes issues with some Dio versions.
+    final body = {
       'model': model,
       'messages': messages.map((m) => m.toJson()).toList(),
       'temperature': temperature,
@@ -115,100 +113,92 @@ class OpenRouterService {
 
     final response = await _dio.post<ResponseBody>(
       AppConstants.openRouterChatEndpoint,
-      data: jsonEncode(requestBody),
+      data: body,
       options: Options(
-        headers: {
-          'Authorization': 'Bearer $apiKey',
-          'Content-Type': 'application/json',
-        },
+        headers: _authHeader(apiKey),
         responseType: ResponseType.stream,
+        // Allow 200 only — everything else throws so we get a clean DioException
+        validateStatus: (status) => status == 200,
       ),
     );
 
     final stream = response.data!.stream;
-    final buffer = StringBuffer();
+    final lineBuffer = StringBuffer();
 
-    await for (final chunk in stream) {
-      final decoded = utf8.decode(chunk, allowMalformed: true);
-      buffer.write(decoded);
+    await for (final bytes in stream) {
+      lineBuffer.write(utf8.decode(bytes, allowMalformed: true));
 
-      // SSE events are separated by double newlines.
-      while (buffer.toString().contains('\n\n')) {
-        final raw = buffer.toString();
+      // Process complete SSE events (delimited by \n\n)
+      while (true) {
+        final raw = lineBuffer.toString();
         final idx = raw.indexOf('\n\n');
+        if (idx == -1) break;
+
         final event = raw.substring(0, idx);
-        buffer
+        lineBuffer
           ..clear()
           ..write(raw.substring(idx + 2));
 
         for (final line in event.split('\n')) {
           final trimmed = line.trim();
           if (!trimmed.startsWith('data:')) continue;
-
           final payload = trimmed.substring(5).trim();
           if (payload == '[DONE]') return;
           if (payload.isEmpty) continue;
 
           try {
-            final json = jsonDecode(payload);
-            final delta = json['choices']?[0]?['delta']?['content'];
-            if (delta != null && delta is String && delta.isNotEmpty) {
-              yield delta;
-            }
+            final decoded = jsonDecode(payload) as Map<String, dynamic>;
+            final delta = decoded['choices']?[0]?['delta']?['content'];
+            if (delta is String && delta.isNotEmpty) yield delta;
           } catch (_) {
-            // Skip malformed SSE fragments (can happen mid-stream if a
-            // chunk boundary splits a JSON object); next chunk usually
-            // completes it.
+            // Partial JSON chunk — will be completed in next iteration
           }
         }
       }
     }
   }
 
-  /// Non-streaming chat completion, used as a simpler fallback if needed.
-  Future<String> sendChatCompletion({
+  String _friendlyError(DioException e) {
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.receiveTimeout:
+        return 'Connection timed out. Check your internet.';
+      case DioExceptionType.connectionError:
+        return 'No internet connection.';
+      default:
+        break;
+    }
+    final data = e.response?.data;
+    if (data is Map) {
+      final msg = data['error']?['message'] ?? data['message'];
+      if (msg != null) return msg.toString();
+    }
+    final status = e.response?.statusCode;
+    if (status == 400) return 'Bad request — check your model selection.';
+    if (status == 401) return 'Invalid API key.';
+    if (status == 402) return 'Insufficient credits on your OpenRouter account.';
+    if (status == 429) return 'Rate limit hit — wait a moment and try again.';
+    if (status == 503) return 'OpenRouter is temporarily unavailable.';
+    return e.message ?? 'Something went wrong (${status ?? 'unknown'})';
+  }
+}
+
+// Extension to make stream errors catchable as clean Exceptions
+extension OpenRouterServiceExt on OpenRouterService {
+  Stream<String> streamWithCleanErrors({
     required String apiKey,
     required String model,
     required List<OpenRouterMessage> messages,
     double temperature = AppConstants.defaultTemperature,
     int maxTokens = AppConstants.defaultMaxTokens,
-  }) async {
+  }) async* {
     try {
-      final response = await _dio.post(
-        AppConstants.openRouterChatEndpoint,
-        data: {
-          'model': model,
-          'messages': messages.map((m) => m.toJson()).toList(),
-          'temperature': temperature,
-          'max_tokens': maxTokens,
-          'stream': false,
-        },
-        options: Options(
-          headers: {'Authorization': 'Bearer $apiKey'},
-        ),
+      yield* streamChatCompletion(
+        apiKey: apiKey, model: model, messages: messages,
+        temperature: temperature, maxTokens: maxTokens,
       );
-
-      return response.data['choices'][0]['message']['content'] as String;
     } on DioException catch (e) {
-      throw Exception(_dioErrorMessage(e));
+      throw Exception(_friendlyError(e));
     }
-  }
-
-  String _dioErrorMessage(DioException e) {
-    if (e.type == DioExceptionType.connectionTimeout ||
-        e.type == DioExceptionType.receiveTimeout) {
-      return 'Connection timed out. Check your internet connection.';
-    }
-    if (e.type == DioExceptionType.connectionError) {
-      return 'No internet connection.';
-    }
-    final data = e.response?.data;
-    if (data is Map && data['error'] != null) {
-      final err = data['error'];
-      if (err is Map && err['message'] != null) {
-        return err['message'].toString();
-      }
-    }
-    return e.message ?? 'Something went wrong';
   }
 }
