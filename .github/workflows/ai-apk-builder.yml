@@ -21,14 +21,29 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Get dependencies
+      - name: Create Android project if missing
         run: |
           if [ ! -d "android" ]; then
+            echo "android/ not found — running flutter create"
             flutter create --platforms=android .
           fi
-          flutter pub get
 
-      - name: Generate Hive adapters
+      - name: Fix gradle.properties JVM args
+        run: |
+          PROPS="android/gradle.properties"
+          # Remove any existing jvmargs line (handles malformed ones)
+          sed -i '/^org\.gradle\.jvmargs/d' "$PROPS" 2>/dev/null || true
+          # Write a clean correct line
+          echo 'org.gradle.jvmargs=-Xmx4g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8' >> "$PROPS"
+          echo 'android.useAndroidX=true' >> "$PROPS"
+          echo 'android.enableJetifier=true' >> "$PROPS"
+          echo "--- gradle.properties ---"
+          cat "$PROPS"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Generate code (build_runner)
         run: dart run build_runner build --delete-conflicting-outputs
 
       - name: Build apk
